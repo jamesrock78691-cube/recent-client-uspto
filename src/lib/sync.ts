@@ -1,6 +1,13 @@
-import { fetchRecentApplications } from "@/lib/uspto";
-import { upsertApplication, getUnemailedApplications, getDefaultTemplate, getGoogleConfig, createLog } from "@/db/operations";
-import { processTemplate, sendEmailWithTemplate, getDefaultEmailTemplate } from "@/lib/email";
+import { fetchRecentTrademarks } from "@/lib/uspto";
+import {
+  upsertApplication,
+  getUnemailedApplications,
+  getDefaultTemplate,
+  getGoogleConfig,
+  createLog,
+  markApplicationEmailSent,
+} from "@/db/operations";
+import { sendEmailWithTemplate, getDefaultEmailTemplate } from "@/lib/email";
 import { appendToSheet, type SheetRow } from "@/lib/google-sheets";
 
 export interface SyncResult {
@@ -9,152 +16,171 @@ export interface SyncResult {
   existingApplications: number;
   emailsSent: number;
   emailsSkippedAttorney: number;
+  emailsSkippedNoEmail: number;
   emailsFailed: number;
   sheetsUpdated: number;
   logs: string[];
 }
 
-/**
- * Main sync function - runs on cron or manual trigger
- * 1. Fetch recent USPTO applications
- * 2. Save to database (upsert)
- * 3. Send emails to applicants (SKIP if attorney present)
- * 4. Sync ALL to Google Sheets (including attorney info)
- */
-export async function runFullSync(daysBack = 3, limit = 50): Promise<SyncResult> {
+/** TRADEMARKS ONLY — skip attorneys, email pro se when email exists */
+export async function runFullSync(daysBack = 2, limit = 100): Promise<SyncResult> {
   const result: SyncResult = {
     totalFetched: 0,
     newApplications: 0,
     existingApplications: 0,
     emailsSent: 0,
     emailsSkippedAttorney: 0,
+    emailsSkippedNoEmail: 0,
     emailsFailed: 0,
     sheetsUpdated: 0,
     logs: [],
   };
 
   try {
-    // Step 1: Fetch from USPTO
-    result.logs.push("Fetching recent applications from USPTO...");
-    await createLog("uspto_fetch", "started", "Fetching applications from USPTO API");
+    result.logs.push("Fetching trademark daily XML (TRTDXFAP)...");
+    await createLog("uspto_fetch", "started", "Fetching trademarks from daily XML");
 
-    const applications = await fetchRecentApplications(daysBack, limit);
+    const applications = await fetchRecentTrademarks(daysBack, limit);
     result.totalFetched = applications.length;
-    result.logs.push(`Found ${applications.length} applications from USPTO`);
+    result.logs.push(`Found ${applications.length} trademark records`);
 
     if (applications.length === 0) {
-      result.logs.push("No new applications found. Sync complete.");
-      await createLog("uspto_fetch", "completed", "No new applications found");
+      result.logs.push("No trademarks found. Check USPTO_ODP_API_KEY and that daily file is published.");
+      await createLog("uspto_fetch", "completed", "No trademarks found");
       return result;
     }
 
-    // Step 2: Save to database
-    result.logs.push("Saving applications to database...");
+    result.logs.push("Saving trademarks to database...");
     for (const app of applications) {
       const appData = {
-        applicationNumber: app.applicationNumber,
-        patentTitle: app.patentTitle,
+        applicationNumber: app.applicationNumber || app.serialNumber,
+        patentTitle: app.patentTitle || app.markText,
         filingDate: app.filingDate ? new Date(app.filingDate) : undefined,
-        publicationDate: app.publicationDate ? new Date(app.publicationDate) : undefined,
-        applicantName: app.applicantName,
-        applicantAddress: app.applicantAddress,
-        applicantEmail: app.applicantEmail || undefined,
-        inventorName: app.inventorName,
+        publicationDate: app.publicationDate
+          ? new Date(app.publicationDate)
+          : app.registrationDate
+            ? new Date(app.registrationDate)
+            : undefined,
+        applicantName: app.applicantName || app.ownerName,
+        applicantAddress: app.applicantAddress || app.ownerAddress,
+        applicantEmail: app.applicantEmail || app.ownerEmail || undefined,
+        inventorName: app.inventorName || app.correspondentName,
         attorneyName: app.attorneyName || undefined,
         attorneyEmail: app.attorneyEmail || undefined,
         hasAttorney: app.hasAttorney || false,
         status: app.status,
-        patentType: app.patentType,
-        abstract: app.abstract,
+        patentType: "Trademark",
+        abstract: app.abstract || app.goodsAndServices,
         usptoApiData: app.raw,
       };
 
       const saved = await upsertApplication(appData);
       if (saved.isNew) {
         result.newApplications++;
-        const attTag = app.hasAttorney ? " [ATTORNEY]" : "";
-        result.logs.push(`NEW: ${app.applicationNumber} - ${app.patentTitle || "Untitled"}${attTag}`);
+        const attTag = app.hasAttorney ? " [ATTORNEY — skip email]" : "";
+        result.logs.push(
+          `NEW TM: ${app.applicationNumber} - ${app.patentTitle || app.markText || "Untitled"}${attTag}`
+        );
       } else {
         result.existingApplications++;
       }
     }
 
-    await createLog("uspto_fetch", "completed", `Fetched ${applications.length}, New: ${result.newApplications}`);
+    await createLog(
+      "uspto_fetch",
+      "completed",
+      `Fetched ${applications.length}, New: ${result.newApplications}`
+    );
 
-    // Step 3: Send emails to applicants (SKIP if has attorney)
-    result.logs.push("Processing emails...");
-    await createLog("email_send", "started", "Sending emails to applicants (skipping attorney cases)");
+    result.logs.push("Processing emails (trademarks only, skip attorneys)...");
+    await createLog("email_send", "started", "Sending to pro se trademark applicants");
 
-    const unemailed = await getUnemailedApplications();
-    const template = await getDefaultTemplate();
-
+    let template = await getDefaultTemplate();
     if (!template) {
-      result.logs.push("No default template found. Creating one...");
+      result.logs.push("Creating default trademark template...");
       const defaultTmpl = getDefaultEmailTemplate();
       const { createEmailTemplate } = await import("@/db/operations");
-      await createEmailTemplate({
-        name: "Default Welcome Template",
+      template = await createEmailTemplate({
+        name: "Default Trademark Template",
         subject: defaultTmpl.subject,
         body: defaultTmpl.body,
         isDefault: true,
       });
     }
 
-    const finalTemplate = template || getDefaultEmailTemplate();
+    const unemailed = await getUnemailedApplications();
 
     for (const app of unemailed) {
-      // ⚠️ SKIP EMAIL if application has an attorney
       if (app.hasAttorney) {
         result.emailsSkippedAttorney++;
-        result.logs.push(`⚖️ SKIPPED (Attorney): ${app.applicationNumber} - ${app.attorneyName || "Unknown attorney"}`);
+        result.logs.push(
+          `SKIPPED (Attorney): ${app.applicationNumber} - ${app.attorneyName || "Unknown"}`
+        );
+        await markApplicationEmailSent(app.id, "skipped_attorney");
         continue;
       }
 
       if (!app.applicantEmail) {
-        result.logs.push(`Skipping ${app.applicationNumber} - no email address`);
+        result.emailsSkippedNoEmail++;
+        result.logs.push(`SKIPPED (no email): ${app.applicationNumber}`);
         continue;
       }
 
       try {
         const usptoApp = {
+          serialNumber: app.applicationNumber,
           applicationNumber: app.applicationNumber,
           patentTitle: app.patentTitle || "",
+          markText: app.patentTitle || "",
           filingDate: app.filingDate?.toISOString().split("T")[0] || "",
           publicationDate: app.publicationDate?.toISOString().split("T")[0] || "",
+          registrationDate: app.publicationDate?.toISOString().split("T")[0] || "",
           applicantName: app.applicantName || "",
+          ownerName: app.applicantName || "",
           applicantAddress: app.applicantAddress || "",
+          ownerAddress: app.applicantAddress || "",
           applicantEmail: app.applicantEmail || "",
+          ownerEmail: app.applicantEmail || "",
           inventorName: app.inventorName || "",
+          correspondentName: app.inventorName || "",
           attorneyName: app.attorneyName || "",
           attorneyEmail: app.attorneyEmail || "",
-          hasAttorney: app.hasAttorney || false,
+          hasAttorney: false,
           status: app.status || "",
-          patentType: app.patentType || "",
+          patentType: "Trademark",
+          markType: "Trademark",
           abstract: app.abstract || "",
-          raw: app.usptoApiData as Record<string, unknown> || {},
+          goodsAndServices: app.abstract || "",
+          raw: (app.usptoApiData as Record<string, unknown>) || {},
         };
 
-        const emailResult = await sendEmailWithTemplate(usptoApp, finalTemplate, template?.id);
+        const emailResult = await sendEmailWithTemplate(
+          usptoApp,
+          { subject: template.subject, body: template.body },
+          template.id
+        );
 
         if (emailResult.success) {
           result.emailsSent++;
-          result.logs.push(`✅ Email sent: ${app.applicationNumber} -> ${app.applicantEmail}`);
+          await markApplicationEmailSent(app.id, "sent");
+          result.logs.push(`Email sent: ${app.applicationNumber} -> ${app.applicantEmail}`);
         } else {
           result.emailsFailed++;
-          result.logs.push(`❌ Email failed: ${app.applicationNumber} - ${emailResult.error}`);
+          result.logs.push(`Email failed: ${app.applicationNumber} - ${emailResult.error}`);
         }
       } catch (error) {
         result.emailsFailed++;
-        result.logs.push(`❌ Email error: ${app.applicationNumber} - ${error}`);
+        result.logs.push(`Email error: ${app.applicationNumber} - ${error}`);
       }
     }
 
-    await createLog("email_send", "completed", `Sent: ${result.emailsSent}, Skipped (Attorney): ${result.emailsSkippedAttorney}, Failed: ${result.emailsFailed}`);
+    await createLog(
+      "email_send",
+      "completed",
+      `Sent: ${result.emailsSent}, Attorney skip: ${result.emailsSkippedAttorney}, No email: ${result.emailsSkippedNoEmail}, Failed: ${result.emailsFailed}`
+    );
 
-    // Step 4: Sync ALL applications to Google Sheets (including attorney ones)
-    result.logs.push("Syncing ALL applications to Google Sheets...");
     const googleConfig = await getGoogleConfig();
-
     if (googleConfig && googleConfig.isActive) {
       for (const app of unemailed) {
         try {
@@ -172,29 +198,25 @@ export async function runFullSync(daysBack = 3, limit = 50): Promise<SyncResult>
             attorneyEmail: app.attorneyEmail || "",
             hasAttorney: isAttorney ? "Yes" : "No",
             status: app.status || "",
-            patentType: app.patentType || "",
+            patentType: "Trademark",
             abstract: app.abstract || "",
-            emailSent: isAttorney ? "Skipped (Attorney)" : (app.emailSent ? "Yes" : "No"),
+            emailSent: isAttorney ? "Skipped (Attorney)" : app.emailSent ? "Yes" : "No",
             emailSentAt: app.emailSentAt ? app.emailSentAt.toLocaleString() : "",
             replyReceived: "No",
             lastUpdated: new Date().toLocaleString(),
           };
-
-          const rowNumber = await appendToSheet(sheetRow);
+          await appendToSheet(sheetRow);
           result.sheetsUpdated++;
-          result.logs.push(`📑 Sheet updated: ${app.applicationNumber} -> Row ${rowNumber}${isAttorney ? " [ATTORNEY]" : ""}`);
         } catch (error) {
-          result.logs.push(`❌ Sheet sync failed: ${app.applicationNumber} - ${error}`);
+          result.logs.push(`Sheet failed: ${app.applicationNumber} - ${error}`);
         }
       }
-      await createLog("google_sheets", "completed", `Updated ${result.sheetsUpdated} rows`);
     } else {
-      result.logs.push("Google Sheets not configured or inactive. Skipping sheet sync.");
+      result.logs.push("Google Sheets not active — skipped.");
     }
 
-    result.logs.push("✅ Sync complete!");
+    result.logs.push("Sync complete (trademarks only).");
     await createLog("sync", "completed", JSON.stringify(result));
-
     return result;
   } catch (error) {
     result.logs.push(`Sync error: ${error}`);
