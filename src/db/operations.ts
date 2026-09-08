@@ -59,7 +59,16 @@ export async function getApplicationByNumber(number: string) {
 export async function getUnemailedApplications() {
   return db.select()
     .from(usptoApplications)
-    .where(isNull(usptoApplications.emailSent));
+    .where(eq(usptoApplications.emailSent, false));
+}
+
+export async function markApplicationEmailSent(id: number, _reason?: string) {
+  const [row] = await db
+    .update(usptoApplications)
+    .set({ emailSent: true, emailSentAt: new Date(), updatedAt: new Date() })
+    .where(eq(usptoApplications.id, id))
+    .returning();
+  return row;
 }
 
 export async function upsertApplication(data: {
