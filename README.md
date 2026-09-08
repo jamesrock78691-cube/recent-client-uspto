@@ -1,56 +1,49 @@
 # Trademark Monitor (USPTO) — pro se outreach
 
-Automatically monitors **new USPTO trademark filings** and emails applicants using your templates.
+Pulls **official Trademark Daily XML** (product `TRTDXFAP`) and emails pro se applicants.
 
-**Patents are not supported.** Attorney-filed trademarks are **always skipped**.
+**Not patents. Attorney filings are skipped.**
 
-## How it works
+## Data source (important)
 
-1. Every ~10 minutes (Vercel Cron) the app scans recent trademark serial numbers via **TSDR**
-2. New filings are saved to Postgres
-3. If the filing has **no attorney** and an **email** is available → send your default template via **Resend**
-4. Optionally log rows to Google Sheets
+TSDR website is **lookup-by-serial**, not a feed of “who filed today.”
 
-> USPTO does not provide a public webhook for “someone just filed.” Near-real-time means frequent polling (cron).
+We use the **Open Data Portal bulk file**:
 
-## Required env vars (Vercel)
-
-| Variable | Purpose |
-|----------|---------|
-| `DATABASE_URL` | Postgres connection string |
-| `RESEND_API_KEY` | Send emails ([resend.com](https://resend.com)) |
-| `USPTO_TSDR_API_KEY` | TSDR key from [account.uspto.gov/api-manager](https://account.uspto.gov/api-manager/) |
-| `TRADEMARK_START_SERIAL` | Bootstrap serial to start scanning (e.g. recent live serial from TSDR) |
-| `EMAIL_FROM` | Verified Resend from-address |
-| `EMAIL_FROM_NAME` | Display name (optional) |
-| `CRON_SECRET` | Optional bearer token for `/api/sync` |
-
-Optional Google Sheets: configure in the UI / `google_sync_config` table.
-
-## Deploy on Vercel
-
-1. Import this GitHub repo in Vercel
-2. Add env vars above
-3. Deploy (Hobby cron minimum interval is 1/day on free; Pro allows `*/10`)
-4. Open the app → set **default email template**
-5. Trigger once: `POST /api/sync` with `{ "daysBack": 2, "limit": 40 }`
-
-## Local
-
-```bash
-npm install
-cp .env.example .env.local   # fill keys
-npx drizzle-kit push         # if using drizzle migrate
-npm run dev
+```
+GET https://api.uspto.gov/api/v1/datasets/products/files/TRTDXFAP/apcYYMMDD.zip
+Header: x-api-key: YOUR_ODP_KEY
 ```
 
-## Rules baked in
+Files publish daily (~01:00 Eastern). Example: `apc260908.zip`.
 
-- **Trademarks only** (TSDR serial scan — no patent APIs)
-- **Skip if `hasAttorney`**
-- **Skip if no email** on the record
-- Template variables: `{{serialNumber}}`, `{{markText}}`, `{{ownerName}}`, `{{filingDate}}`, `{{status}}`, `{{goodsAndServices}}`, …
+Get a free key: [account.uspto.gov](https://account.uspto.gov) → API / Open Data Portal.
 
-## Notes on emails
+## Env vars
 
-Many trademarks list a **correspondent** email that is the attorney. Pro se filers are the main targets this tool will email. Mass commercial email must follow CAN-SPAM and applicable solicitation rules.
+| Variable | Required | Purpose |
+|----------|----------|---------|
+| `DATABASE_URL` | yes | Postgres |
+| `RESEND_API_KEY` | yes | Send mail |
+| `USPTO_ODP_API_KEY` | yes | Download daily trademark XML |
+| `USPTO_TSDR_API_KEY` | optional | Single-serial enrichment |
+| `EMAIL_FROM` | recommended | Verified Resend from |
+| `CRON_SECRET` | optional | Protect `/api/sync` |
+
+## Flow
+
+1. Cron / manual sync downloads `apcYYMMDD.zip` for last N days
+2. Parses case-files → serial, mark, owner, attorney, goods/services
+3. **Skip if attorney present**
+4. Email only if an email is on the record (mostly pro se)
+5. Optional Google Sheets
+
+## Deploy Vercel
+
+Import repo → set env → deploy → set default template in UI → Run Sync.
+
+Hobby cron is limited; Pro needed for frequent schedules.
+
+## Local core file
+
+If `src/lib/uspto.ts` on GitHub still shows patent code, replace it with the Trademark Daily XML version from your latest workspace copy (or ask to re-push).
